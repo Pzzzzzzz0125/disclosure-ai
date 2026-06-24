@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, render_template_string, redirect, url_for
+from flask import Flask, request, render_template_string, redirect, url_for, session, Response
 from werkzeug.utils import secure_filename
 import fitz  # PyMuPDF
 import docx
@@ -9,8 +9,8 @@ import google.generativeai as genai
 import json
 from PIL import Image
 import pytesseract
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
-import pytesseract
+import csv
+from datetime import datetime
 import io
 
 # --- Gemini API Configuration ---
@@ -20,6 +20,8 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 # Initialize the Flask application
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
+# A secret key is required to use sessions in Flask
+app.secret_key = os.urandom(24)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # --- Helper Functions for Text Extraction ---
@@ -91,13 +93,13 @@ repair need, fungus condition, moisture issue, pest issue,
 or condition likely to lead to future damage.
 
 
-3. If the report mentions 10 separate issues, return 10 entries.
+2. If the report mentions 10 separate issues, return 10 entries.
 
-4. Treat each inspection item separately.
+3. Treat each inspection item separately.
 
-5. Include future-risk conditions even if no visible damage exists.
+4. Include future-risk conditions even if no visible damage exists.
 
-6. Include:
+5. Include:
    - fungus
    - moisture
    - leaks
@@ -107,7 +109,7 @@ or condition likely to lead to future damage.
    - conditions likely to lead to future damage
    - recommendations for replacement or repair
 
-7. Never combine multiple issues into one.
+6. Never combine multiple issues into one.
 
 Return JSON only.
 
@@ -159,10 +161,7 @@ Document:
             "top_k": 1
         }
 
-        response = model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
+        response = model.generate_content(prompt, generation_config=generation_config)
         try:
             # The model sometimes wraps the JSON in markdown. We need to extract the raw JSON string.
             response_text = response.text
@@ -184,55 +183,165 @@ Document:
 
 # --- Flask Routes ---
 
+DOCUMENT_TYPES = {
+    'tds': {'name': 'Transfer Disclosure Statement', 'required': True, 'description': 'Standard state-mandated disclosure form.'},
+    'spq': {'name': 'Seller Property Questionnaire', 'required': True, 'description': 'Detailed questionnaire filled out by the seller.'},
+    'nhd': {'name': 'Natural Hazard Disclosure Report', 'required': True, 'description': 'Report on natural hazards affecting the property.'},
+    'prelim': {'name': 'Preliminary Report', 'required': True, 'description': 'Provides details on title, liens, and encumbrances.'},
+    'inspection': {'name': 'Home Inspection Report', 'required': False, 'description': 'Professional home inspection findings.'},
+    'non_foreign': {'name': "Seller's Affidavit of Non-Foreign Status", 'required': False, 'description': 'FIRPTA compliance form.'}
+}
+
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
     if request.method == 'POST':
-        # Use getlist to handle multiple files
-        uploaded_files = request.files.getlist("file")
-        if not uploaded_files or uploaded_files[0].filename == '':
-            return redirect(request.url)
+        if 'uploaded_docs' not in session:
+            session['uploaded_docs'] = {}
 
-        all_results = []
-        for file in uploaded_files:
+        for doc_key, file in request.files.items():
             if file and file.filename:
                 filename = secure_filename(file.filename)
-                file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                # Ensure a unique folder for this session/upload batch
+                session_folder = session.get('session_folder')
+                if not session_folder:
+                    session_folder = datetime.now().strftime("%Y%m%d%H%M%S%f")
+                    session['session_folder'] = session_folder
+                
+                save_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_folder)
+                os.makedirs(save_dir, exist_ok=True)
+                file_path = os.path.join(save_dir, filename)
                 file.save(file_path)
 
-                # If the uploaded file is a ZIP archive
-                if filename.lower().endswith('.zip'):
-                    extract_folder = os.path.join(app.config['UPLOAD_FOLDER'], f"extracted_{os.path.splitext(filename)[0]}")
-                    os.makedirs(extract_folder, exist_ok=True)
-                    
-                    try:
-                        with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                            zip_ref.extractall(extract_folder)
-                        
-                        # Process each file in the extracted folder
-                        for extracted_filename in os.listdir(extract_folder):
-                            extracted_file_path = os.path.join(extract_folder, extracted_filename)
-                            if os.path.isfile(extracted_file_path):
-                                text = process_single_file(extracted_file_path, extracted_filename)
-                                analysis_result = analyze_document_with_ai(text)
-                                # Pass the raw dictionary to the template for structured display
-                                all_results.append({'filename': f"{filename} -> {extracted_filename}", 'result': analysis_result})
-                    finally:
-                        # Clean up the extracted files and folder
-                        shutil.rmtree(extract_folder)
-                
-                # If it's a regular, single file
-                else:
-                    text = process_single_file(file_path, filename)
-                    analysis_result = analyze_document_with_ai(text)
-                    # Pass the raw dictionary to the template for structured display
-                    all_results.append({'filename': filename, 'result': analysis_result})
-
-
-        # Display the results for all processed files
-        return render_template_string(HTML_TEMPLATE, results=all_results)
+                session['uploaded_docs'][doc_key] = {
+                    'filename': filename,
+                    'uploaded_at': datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    'path': file_path,
+                    'source': 'Manual'
+                }
+        
+        # This is where you would trigger analysis. For now, we just show the checklist.
+        return redirect(url_for('analyze_all'))
 
     # Initial page load
-    return render_template_string(HTML_TEMPLATE, results=None)
+    # For a new session, clear old data
+    if request.method == 'GET' and not request.args:
+        session.pop('uploaded_docs', None)
+        session.pop('session_folder', None)
+
+    uploaded_docs = session.get('uploaded_docs', {})
+    
+    # Calculate progress statistics
+    total_docs = len(DOCUMENT_TYPES)
+    required_docs = {k:v for k,v in DOCUMENT_TYPES.items() if v['required']}
+    
+    loaded_count = len(uploaded_docs)
+    required_loaded_count = sum(1 for k in required_docs if k in uploaded_docs)
+    
+    progress_percent = int((loaded_count / total_docs) * 100) if total_docs > 0 else 0
+    all_required_loaded = required_loaded_count == len(required_docs)
+
+    stats = {'total_docs': total_docs, 'loaded_count': loaded_count, 'progress_percent': progress_percent, 'all_required_loaded': all_required_loaded}
+
+    return render_template_string(HTML_TEMPLATE, doc_types=DOCUMENT_TYPES, uploaded_docs=uploaded_docs, stats=stats)
+
+@app.route('/analyze')
+def analyze_all():
+    # This is a placeholder for the analysis logic.
+    # In a real app, this would iterate through session['uploaded_docs'],
+    # run analysis on each, and display a results page.
+    # For now, let's just show the uploaded files.
+    uploaded_docs = session.get('uploaded_docs', {})
+    if not uploaded_docs:
+        return redirect(url_for('upload_file'))
+
+    all_results = []
+    for doc_key, doc_info in uploaded_docs.items():
+        text = process_single_file(doc_info['path'], doc_info['filename'])
+        analysis_result = analyze_document_with_ai(text)
+        all_results.append({'filename': f"{DOCUMENT_TYPES[doc_key]['name']} ({doc_info['filename']})", 'result': analysis_result})
+    
+    # Save results to session so they can be downloaded
+    session['analysis_results'] = all_results
+    
+    stats = _get_progress_stats()
+    uploaded_docs = session.get('uploaded_docs', {})
+
+    # Redirect to the main page to show results
+    return render_template_string(HTML_TEMPLATE, doc_types=DOCUMENT_TYPES, uploaded_docs=uploaded_docs, results=all_results, stats=stats)
+
+@app.route('/bulk_analyze', methods=['POST'])
+def bulk_analyze():
+    """Handles the simple folder upload and immediate analysis."""
+    uploaded_files = request.files.getlist("bulk_files")
+    if not uploaded_files or uploaded_files[0].filename == '':
+        return redirect(url_for('upload_file'))
+
+    all_results = []
+    # Create a unique folder for this bulk upload to avoid filename collisions
+    session_folder = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    save_dir = os.path.join(app.config['UPLOAD_FOLDER'], session_folder)
+    os.makedirs(save_dir, exist_ok=True)
+
+    for file in uploaded_files:
+        if file and file.filename:
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(save_dir, filename)
+            file.save(file_path)
+
+            text = process_single_file(file_path, filename)
+            analysis_result = analyze_document_with_ai(text)
+            all_results.append({'filename': filename, 'result': analysis_result})
+
+    # Save results to session for downloading
+    session['analysis_results'] = all_results
+    
+    # Render the main template, showing the results but with an empty checklist
+    stats = _get_progress_stats() # This will show 0% progress for the checklist
+    return render_template_string(HTML_TEMPLATE, doc_types=DOCUMENT_TYPES, uploaded_docs={}, results=all_results, stats=stats)
+
+@app.route('/download_csv')
+def download_csv():
+    """Generates and serves a CSV file of the analysis results."""
+    results = session.get('analysis_results', [])
+    if not results:
+        return redirect(url_for('upload_file'))
+
+    # Use an in-memory string buffer
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Write the header
+    header = ['Source File', 'Location', 'Item', 'Category', 'Description', 'Severity']
+    writer.writerow(header)
+
+    # Write the data rows
+    for item in results:
+        filename = item.get('filename', 'N/A')
+        if item.get('result', {}).get('problems'):
+            for problem in item['result']['problems']:
+                row = [
+                    filename,
+                    problem.get('location', 'N/A'),
+                    problem.get('item', 'N/A'),
+                    problem.get('category', 'N/A'),
+                    problem.get('description', 'N/A'),
+                    problem.get('severity', 'N/A')
+                ]
+                writer.writerow(row)
+
+    output.seek(0)
+    return Response(output, mimetype="text/csv", headers={"Content-Disposition":"attachment;filename=disclosure_analysis.csv"})
+
+def _get_progress_stats():
+    """Helper function to calculate and return upload progress stats."""
+    uploaded_docs = session.get('uploaded_docs', {})
+    total_docs = len(DOCUMENT_TYPES)
+    required_docs = {k:v for k,v in DOCUMENT_TYPES.items() if v['required']}
+    loaded_count = len(uploaded_docs)
+    required_loaded_count = sum(1 for k in required_docs if k in uploaded_docs)
+    progress_percent = int((loaded_count / total_docs) * 100) if total_docs > 0 else 0
+    all_required_loaded = required_loaded_count == len(required_docs)
+    return {'total_docs': total_docs, 'loaded_count': loaded_count, 'progress_percent': progress_percent, 'all_required_loaded': all_required_loaded}
 
 def process_single_file(file_path, filename):
     """Helper function to extract text from a single file based on its extension."""
@@ -262,7 +371,42 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: sans-serif; background-color: #f4f4f9; color: #333; margin: 40px; }
         .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        .progress-summary { text-align: center; margin-bottom: 30px; }
+        .progress-bar { background-color: #e9ecef; border-radius: .25rem; height: 1rem; }
+        .progress-bar-inner { background-color: #007bff; height: 1rem; border-radius: .25rem; }
+        .section { border: 1px solid #dee2e6; border-radius: 5px; padding: 20px; margin-top: 30px; }
+        .section h2 { margin-top: 0; }
+        .section p { color: #6c757d; }
+        .section input[type=text] { width: 100%; padding: 8px; margin-top: 10px; }
+        .doc-table { width: 100%; margin-top: 20px; border-collapse: collapse; }
+        .doc-table th, .doc-table td { padding: 12px; border-bottom: 1px solid #dee2e6; text-align: left; }
+        .doc-table th { font-weight: bold; color: #495057; }
+        .doc-list { list-style: none; padding: 0; }
+        .doc-item { background: #f8f9fa; border: 1px solid #dee2e6; padding: 15px; margin-bottom: 10px; border-radius: 5px; display: flex; align-items: center; justify-content: space-between; }
+        .doc-info h3 { margin: 0; font-size: 1.1em; }
+        .doc-info p { margin: 5px 0 0; color: #6c757d; font-size: 0.9em; }
+        .doc-status { text-align: right; }
+        .status-uploaded { color: #28a745; font-weight: bold; }
+        .status-missing { color: #dc3545; font-weight: bold; }
+        .status-manual { color: #17a2b8; }
+        .status-auto { color: #28a745; }
+        .doc-actions .btn { padding: 5px 10px; font-size: 0.8em; cursor: pointer; }
+        .btn-preview { background-color: #007bff; color: white; border: none; border-radius: 3px; }
+        .btn-replace { background-color: #ffc107; color: black; border: none; border-radius: 3px; }
         h1, h2 { color: #0056b3; }
+        .summary-box {
+            display: flex;
+            justify-content: space-around;
+            background-color: #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .summary-item { text-align: center; }
+        .summary-item h3 { margin: 0; font-size: 24px; }
+        .summary-item p { margin: 0; color: #6c757d; }
+        .summary-high { color: #721c24 !important; }
+        .summary-medium { color: #856404 !important; }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         thead { background-color: #0056b3; color: white; }
@@ -312,14 +456,91 @@ HTML_TEMPLATE = """
         <p style="margin-top: 20px;">Analyzing documents, please wait...</p>
     </div>
     <div class="container">
-        <h1>Upload Disclosure Document</h1>
-        <p>Click the button below to select a folder containing your disclosure documents.</p>
-        <p>You can select multiple files by holding down Shift or Ctrl/Cmd.</p>
-        <form id="upload-form" method=post enctype=multipart/form-data>
-            <input type="file" name="file" webkitdirectory multiple>
-            <input type=submit value=Upload and Analyze>
-        </form>
+        <h1>Upload Documents</h1>
+        <p>Load property disclosure documents manually or use the disclosure link to auto-fetch available files.</p>
+
+        <div class="progress-summary">
+            <div class="progress-bar">
+                <div class="progress-bar-inner" style="width: {{ stats.progress_percent }}%;"></div>
+            </div>
+            <p style="margin-top: 10px;"><b>{{ stats.progress_percent }}%</b></p>
+            <p><b>{{ stats.loaded_count }} of {{ stats.total_docs }} Documents Loaded</b></p>
+            <p>{{ stats.total_docs - stats.loaded_count }} documents remaining to analyze</p>
+        </div>
+
+        <div class="section">
+            <h2>1. Auto Load from Disclosure Link</h2>
+            <p>Paste the disclosure link below and we'll automatically fetch available documents.</p>
+            <input type="text" placeholder="Paste disclosure link here...">
+            <!-- In a real app, this would have JS to trigger a fetch -->
+        </div>
+
+        <div class="section">
+            <h2>2. Manual Checklist Upload</h2>
+            <p>Review, preview, or upload documents before running the analysis.</p>
+            <form id="upload-form" method=post enctype=multipart/form-data>
+                <table class="doc-table">
+                    <thead>
+                        <tr><th colspan="4">Required Documents</th></tr>
+                        <tr>
+                            <th>Document Type</th>
+                            <th>Uploaded Document Name</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for key, doc in doc_types.items() if doc.required %}
+                        <tr>
+                            <td><b>{{ doc.name }}*</b><br><small>{{ doc.description }}</small></td>
+                            <td>{{ uploaded_docs[key].filename if uploaded_docs.get(key) else '—' }}</td>
+                            <td>
+                                {% if uploaded_docs.get(key) %}
+                                    <span class="status-manual">Loaded (Manual)</span>
+                                {% else %}
+                                    <span class="status-missing">Missing</span>
+                                {% endif %}
+                            </td>
+                            <td><input type="file" name="{{ key }}"></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                    <thead>
+                        <tr><th colspan="4" style="padding-top: 30px;">Optional Documents</th></tr>
+                    </thead>
+                    <tbody>
+                        {% for key, doc in doc_types.items() if not doc.required %}
+                        <tr>
+                            <td><b>{{ doc.name }}</b><br><small>{{ doc.description }}</small></td>
+                            <td>{{ uploaded_docs[key].filename if uploaded_docs.get(key) else '—' }}</td>
+                            <td>
+                                {% if uploaded_docs.get(key) %}
+                                    <span class="status-manual">Loaded (Manual)</span>
+                                {% else %}
+                                    <span>Not uploaded</span>
+                                {% endif %}
+                            </td>
+                            <td><input type="file" name="{{ key }}"></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                <input type=submit value="Upload Selected Files">
+            </form>
+        </div>
+
+        <div class="section">
+            <h2>3. Bulk Folder Upload & Analyze</h2>
+            <p>Select a folder, and we will immediately analyze all documents inside it.</p>
+            <form id="bulk-upload-form" action="/bulk_analyze" method="post" enctype="multipart/form-data">
+                <input type="file" name="bulk_files" webkitdirectory multiple>
+                <input type="submit" value="Upload Folder and Analyze">
+            </form>
+        </div>
+
         {% if results %}
+            <hr style="margin-top: 30px;">
+            <h2>Analysis Results</h2>
             {% for item in results %}
                 <div class="result" style="white-space: normal;">
                     <h2>Analysis for: {{ item.filename }}</h2>
@@ -329,7 +550,6 @@ HTML_TEMPLATE = """
                                 <tr>
                                     <th>Location</th>
                                     <th>Item</th>
-                                    <th>Category</th>
                                     <th>Description</th>
                                     <th>Severity</th>
                                 </tr>
@@ -339,7 +559,6 @@ HTML_TEMPLATE = """
                                 <tr>
                                     <td>{{ problem.get('location', 'N/A') }}</td>
                                     <td>{{ problem.get('item', 'N/A') }}</td>
-                                    <td>{{ problem.get('category', 'N/A') }}</td>
                                     <td>{{ problem.get('description', 'N/A') }}</td>
                                     <td class="severity-{{ problem.get('severity', '')|lower }}">{{ problem.get('severity', 'N/A') }}</td>
                                 </tr>
@@ -353,16 +572,44 @@ HTML_TEMPLATE = """
                     {% endif %}
                 </div>
             {% endfor %}
+            <a href="/download_csv" class="download-button">Download All Results as CSV</a>
         {% endif %}
     </div>
+    <style>
+        .download-button {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 10px 15px;
+            background-color: #28a745;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+    </style>
     <script>
         document.getElementById('upload-form').addEventListener('submit', function() {
             // Show the loader when the form is submitted
             const loader = document.getElementById('loader-overlay');
             loader.style.display = 'flex';
         });
+
+        const bulkForm = document.getElementById('bulk-upload-form');
+        if (bulkForm) {
+            bulkForm.addEventListener('submit', function() {
+                document.getElementById('loader-overlay').style.display = 'flex';
+            });
+        }
+
+        const analyzeButton = document.getElementById('analyze-button');
+        if (analyzeButton) {
+            analyzeButton.addEventListener('click', function() {
+                document.getElementById('loader-overlay').style.display = 'flex';
+            });
+        }
     </script>
 </body>
+
 </html>
 """
 
