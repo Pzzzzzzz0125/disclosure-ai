@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, render_template_string, redirect, url_for, session, Response
+from flask import Flask, request, render_template_string, redirect, url_for, session, Response, send_from_directory
 from werkzeug.utils import secure_filename
 import fitz  # PyMuPDF
 import docx
@@ -20,8 +20,8 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 # Initialize the Flask application
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-# A secret key is required to use sessions in Flask
-app.secret_key = os.urandom(24)
+# Use a static secret key for development to ensure session persistence between restarts.
+app.secret_key = "a-dev-secret-key-that-should-be-changed"
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # --- Helper Functions for Text Extraction ---
@@ -154,31 +154,97 @@ Document:
 """
     try:
         print("--- Sending text to Gemini API for analysis ---")
-        model = genai.GenerativeModel('gemini-3.1-flash-lite')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         generation_config = {
             "temperature": 0,
-            "top_p": 0.1,
-            "top_k": 1
+            "response_mime_type": "application/json"
         }
 
         response = model.generate_content(prompt, generation_config=generation_config)
+        print("RAW RESPONSE (analyze_document_with_ai):", response.text)
         try:
-            # The model sometimes wraps the JSON in markdown. We need to extract the raw JSON string.
-            response_text = response.text
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            if json_start != -1 and json_end != 0:
-                json_string = response_text[json_start:json_end]
-                return json.loads(json_string)
-            else:
-                # If we can't find a JSON object, raise an error to be caught below.
-                raise json.JSONDecodeError("Could not find JSON object in response", response_text, 0)
+            return json.loads(response.text)
         except json.JSONDecodeError:
             print(f"Error: AI did not return valid JSON. Response:\n{response.text}")
             return {"error": "AI response was not in a valid JSON format."}
     except Exception as e:
         print(f"Error calling Gemini API: {e}")
         return {"error": f"An error occurred: {e}"}
+
+def summarize_document_with_ai(doc_name, text):
+    """Generates a structured summary for a single document."""
+    prompt = f"""
+    You are a real estate analyst. Your task is to create a structured summary of the provided disclosure document.
+    The document is a '{doc_name}'.
+
+    Analyze the text below and extract the following information:
+    - `purpose`: A one-sentence description of the document's purpose.
+    - `defects`: An array of strings for explicitly mentioned problems (max 3 items).
+    - `foundation`: An array of strings for any mentions of foundation issues (max 3 items).
+    - `systems`: An array of strings for key property systems mentioned (max 3 items).
+    - `other`: An array of strings for other notable disclosures (max 3 items).
+
+    Format your response as a single JSON object with keys: "purpose", "defects", "foundation", "systems", "other".
+    Each key except "purpose" should contain an array of strings. If a section has no items, return an empty array.
+
+    Document Text:
+    ---
+    {text}
+    ---
+    """
+    try:
+        print(f"--- Summarizing '{doc_name}' with Gemini ---")
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        generation_config = {"temperature": 0, "response_mime_type": "application/json"}
+        response = model.generate_content(prompt, generation_config=generation_config)
+        print("RAW RESPONSE (summarize_document_with_ai):", response.text)
+        try:
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            return {"error": "AI response for summary was not in a valid JSON format."}
+    except Exception as e:
+        print(f"Error during summarization: {e}")
+        return {"error": f"An error occurred during summarization: {e}"}
+
+def synthesize_findings_with_ai(all_docs_text):
+    """Generates high-level insights from all documents combined."""
+    prompt = f"""
+    You are a senior real estate risk analyst. You have been given a collection of disclosure documents for a single property.
+    Your primary task is to **synthesize** information across all documents to find **recurring themes and corroborated risks**.
+    Identify the top 1-2 highest priority risks that are **mentioned or hinted at in multiple documents**. For example, if a water leak is mentioned in the SPQ and water stains are noted in the Home Inspection, that is a high-priority synthesized finding.
+
+    For each high-priority risk you identify, provide the following in a structured format:
+    - `risk_title`: A clear, concise title for the risk (e.g., "Water Intrusion History").
+    - `risk_level`: A string: "High", "Medium", or "Low".
+    - `short_summary`: A one-sentence summary of the issue.
+    - `evidence_sources`: An array of strings listing the document types where this was mentioned (e.g., ["SPQ", "TDS"]).
+    - `potential_impacts`: An array of strings describing potential consequences (max 3 items, e.g., ["Mold growth", "Structural damage"]).
+    - `cost_implication`: A string: "High", "Medium", or "Low".
+    - `recommended_action`: A short, actionable recommendation.
+    - `next_steps`: An array of strings with 2-3 concrete next steps.
+
+    Format your entire response as a single JSON object with two top-level keys: `key_findings` (an array of the risk objects) and `confidence` (a string: "High", "Medium", or "Low").
+    If no significant cross-document risks are found, return an empty array.
+
+    Combined Document Texts:
+    ---
+    {all_docs_text}
+    ---
+    """
+    try:
+        print("--- Synthesizing key findings with Gemini ---")
+        # Use the more powerful model for this complex task
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        generation_config = {"temperature": 0, "response_mime_type": "application/json"}
+        response = model.generate_content(prompt, generation_config=generation_config)
+        print("RAW RESPONSE (synthesize_findings_with_ai):", response.text)
+        try:
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            return {"error": "AI response for synthesis was not in a valid JSON format."}
+    except Exception as e:
+        print(f"Error during synthesis: {e}")
+        return {"error": f"An error occurred during synthesis: {e}"}
 
 
 # --- Flask Routes ---
@@ -254,20 +320,22 @@ def analyze_all():
     if not uploaded_docs:
         return redirect(url_for('upload_file'))
 
-    all_results = []
+    document_summaries = []
+    all_text_for_synthesis = ""
+
     for doc_key, doc_info in uploaded_docs.items():
         text = process_single_file(doc_info['path'], doc_info['filename'])
-        analysis_result = analyze_document_with_ai(text)
-        all_results.append({'filename': f"{DOCUMENT_TYPES[doc_key]['name']} ({doc_info['filename']})", 'result': analysis_result})
-    
-    # Save results to session so they can be downloaded
-    session['analysis_results'] = all_results
-    
-    stats = _get_progress_stats()
-    uploaded_docs = session.get('uploaded_docs', {})
+        doc_name = DOCUMENT_TYPES[doc_key]['name']
+        
+        summary = summarize_document_with_ai(doc_name, text)
+        document_summaries.append({'doc_key': doc_key, 'doc_name': doc_name, 'summary': summary})
+        
+        all_text_for_synthesis += f"\n\n--- Start of Document: {doc_name} ---\n{text}\n--- End of Document: {doc_name} ---\n"
 
-    # Redirect to the main page to show results
-    return render_template_string(HTML_TEMPLATE, doc_types=DOCUMENT_TYPES, uploaded_docs=uploaded_docs, results=all_results, stats=stats)
+    # Generate the high-level synthesis
+    key_findings = synthesize_findings_with_ai(all_text_for_synthesis)
+
+    return render_template_string(ANALYSIS_TEMPLATE, uploaded_docs=uploaded_docs, doc_types=DOCUMENT_TYPES, summaries=document_summaries, key_findings=key_findings)
 
 @app.route('/bulk_analyze', methods=['POST'])
 def bulk_analyze():
@@ -298,6 +366,15 @@ def bulk_analyze():
     # Render the main template, showing the results but with an empty checklist
     stats = _get_progress_stats() # This will show 0% progress for the checklist
     return render_template_string(HTML_TEMPLATE, doc_types=DOCUMENT_TYPES, uploaded_docs={}, results=all_results, stats=stats)
+
+@app.route('/view_doc/<doc_key>')
+def view_doc(doc_key):
+    """Serves an uploaded file for viewing."""
+    uploaded_docs = session.get('uploaded_docs', {})
+    doc_info = uploaded_docs.get(doc_key)
+    if doc_info and os.path.exists(doc_info['path']):
+        return send_from_directory(os.path.dirname(doc_info['path']), os.path.basename(doc_info['path']))
+    return "File not found or session expired.", 404
 
 @app.route('/download_csv')
 def download_csv():
@@ -356,6 +433,9 @@ def process_single_file(file_path, filename):
         # This message will be shown for unsupported files inside a zip
         # or for unsupported single uploads.
         text = "Unsupported file type."
+    print(f"EXTRACTED TEXT LENGTH for {filename}: {len(text)}")
+    if len(text.strip()) > 0:
+        print(f"TEXT SNIPPET: {text.strip()[:500]}")
     return text
 
 # --- HTML Template ---
@@ -538,42 +618,6 @@ HTML_TEMPLATE = """
             </form>
         </div>
 
-        {% if results %}
-            <hr style="margin-top: 30px;">
-            <h2>Analysis Results</h2>
-            {% for item in results %}
-                <div class="result" style="white-space: normal;">
-                    <h2>Analysis for: {{ item.filename }}</h2>
-                    {% if item.result.get('problems') and item.result.get('problems')|length > 0 %}
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Location</th>
-                                    <th>Item</th>
-                                    <th>Description</th>
-                                    <th>Severity</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for problem in item.result.problems %}
-                                <tr>
-                                    <td>{{ problem.get('location', 'N/A') }}</td>
-                                    <td>{{ problem.get('item', 'N/A') }}</td>
-                                    <td>{{ problem.get('description', 'N/A') }}</td>
-                                    <td class="severity-{{ problem.get('severity', '')|lower }}">{{ problem.get('severity', 'N/A') }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    {% elif item.result.get('error') %}
-                        <p class="severity-high">Error: {{ item.result.get('error') }}</p>
-                    {% else %}
-                        <p class="no-problems">No problems were identified in this document.</p>
-                    {% endif %}
-                </div>
-            {% endfor %}
-            <a href="/download_csv" class="download-button">Download All Results as CSV</a>
-        {% endif %}
     </div>
     <style>
         .download-button {
@@ -610,6 +654,120 @@ HTML_TEMPLATE = """
     </script>
 </body>
 
+</html>
+"""
+
+# --- Analysis Page Template ---
+ANALYSIS_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Disclosure AI - Analysis Report</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f4f4f9; color: #333; margin: 40px; }
+        .dashboard-container { display: grid; grid-template-columns: 1fr 2fr; gap: 30px; max-width: 1400px; margin: auto; }
+        .left-panel, .right-panel { display: flex; flex-direction: column; gap: 20px; }
+        .card { background: white; padding: 20px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        h1, h2, h3 { color: #0056b3; }
+        h2 { margin-top: 0; }
+        .doc-list { list-style: none; padding: 0; }
+        .doc-list-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-radius: 8px; cursor: pointer; }
+        .doc-list-item:hover { background-color: #e9ecef; }
+        .btn-preview { padding: 5px 10px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-size: 0.9em; }
+        .risk-card { border-left: 5px solid; }
+        .risk-card.high { border-color: #dc3545; background-color: #f8d7da; }
+        .risk-card.medium { border-color: #ffc107; background-color: #fff3cd; }
+        .risk-card.low { border-color: #28a745; background-color: #d4edda; }
+        .risk-badge { padding: 3px 8px; border-radius: 12px; color: white; font-size: 0.8em; font-weight: bold; }
+        .badge-high { background-color: #dc3545; }
+        .badge-medium { background-color: #ffc107; }
+        .badge-low { background-color: #28a745; }
+        .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; }
+        details > summary { cursor: pointer; font-weight: bold; font-size: 1.1em; padding: 10px; border-radius: 8px; }
+        details > summary:hover { background-color: #f8f9fa; }
+        details[open] > summary { background-color: #e9ecef; }
+        .details-content { padding: 15px; border-top: 1px solid #dee2e6; }
+        .error-box { background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 20px; border-radius: 5px; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="dashboard-container">
+        <div class="left-panel">
+            <div class="card">
+                <h2>Documents</h2>
+                <ul class="doc-list">
+                    {% for key, doc_info in uploaded_docs.items() %}
+                    <li class="doc-list-item">
+                        <span>{{ doc_types[key].name }}</span>
+                        <a href="/view_doc/{{ key }}" target="_blank" class="btn-preview">Preview</a>
+                    </li>
+                    {% endfor %}
+                </ul>
+            </div>
+            <div class="card">
+                <h2>Document Summaries</h2>
+                {% for summary_item in summaries %}
+                <details>
+                    <summary>{{ summary_item.doc_name }}</summary>
+                    <div class="details-content">
+                        <p><em>{{ summary_item.summary.get('purpose', 'N/A') }}</em></p>
+                        {% if summary_item.summary.get('error') %}
+                            <div class="error-box"><p><strong>Error:</strong> {{ summary_item.summary.get('error') }}</p></div>
+                        {% endif %}
+                        {% if summary_item.summary.get('defects') %}<h5>Defects</h5><ul>{% for item in summary_item.summary.defects %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+                        {% if summary_item.summary.get('foundation') %}<h5>Foundation</h5><ul>{% for item in summary_item.summary.foundation %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+                        {% if summary_item.summary.get('systems') %}<h5>Systems</h5><ul>{% for item in summary_item.summary.systems %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+                        {% if summary_item.summary.get('other') %}<h5>Other</h5><ul>{% for item in summary_item.summary.other %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+                    </div>
+                </details>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="right-panel">
+            <div class="card">
+                <h2>Key Findings & AI Insights</h2>
+                <p>Overall Analysis Confidence: <strong>{{ key_findings.get('confidence', 'N/A') }}</strong></p>
+                {% if key_findings.get('error') %}
+                    <div class="error-box"><p><strong>Error during synthesis:</strong> {{ key_findings.get('error') }}</p></div>
+                {% endif %}
+                {% for finding in key_findings.get('key_findings', []) %}
+                    <div class="card risk-card {{ finding.risk_level|lower }}" style="margin-top: 15px;">
+                        <h3>
+                            {{ finding.risk_title }}
+                            <span class="risk-badge badge-{{ finding.risk_level|lower }}">{{ finding.risk_level }}</span>
+                        </h3>
+                        <p><em>{{ finding.short_summary }}</em></p>
+                        <div class="summary-grid">
+                            <div class="card">
+                                <h5>Potential Impacts</h5>
+                                <ul>{% for impact in finding.potential_impacts %}<li>{{ impact }}</li>{% endfor %}</ul>
+                            </div>
+                            <div class="card">
+                                <h5>Suggested Next Steps</h5>
+                                <ul>{% for step in finding.next_steps %}<li>{{ step }}</li>{% endfor %}</ul>
+                            </div>
+                        </div>
+                        <p style="font-size: 0.8em; color: #6c757d; margin-top: 15px;">
+                            <strong>Evidence:</strong> {{ finding.evidence_sources|join(', ') }} |
+                            <strong>Cost Implication:</strong> {{ finding.cost_implication }} |
+                            <strong>Recommended Action:</strong> {{ finding.recommended_action }}
+                        </p>
+                    </div>
+                {% else %}
+                    <p>No high-priority cross-document risks were identified.</p>
+                {% endfor %}
+            </div>
+            <div class="card">
+                <h2>Follow-up Chat</h2>
+                <p style="color: #6c757d;">Ask the AI a follow-up question about these findings.</p>
+                <input type="text" placeholder="e.g., 'What are the typical costs to repair foundation cracks?'" style="width: 95%; padding: 10px; border: 1px solid #ccc; border-radius: 5px;">
+            </div>
+        </div>
+    </div>
+</body>
 </html>
 """
 
