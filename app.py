@@ -12,11 +12,30 @@ import pytesseract
 import csv
 from datetime import datetime
 import io
+import re
+from difflib import SequenceMatcher
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
+
+try:
+    import faiss
+except ImportError:
+    faiss = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 # --- Gemini API Configuration ---
 # The API key is read from an environment variable for security.
-# Make sure to set `export GEMINI_API_KEY="YOUR_API_KEY"` in your terminal.
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# Make sure to set `export GOOGLE_API_KEY="YOUR_API_KEY"` in your terminal.
+# `GEMINI_API_KEY` is also accepted for backwards compatibility.
+GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
 # Initialize the Flask application
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -26,32 +45,58 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # --- Helper Functions for Text Extraction ---
 
+def gemini_api_key_error():
+    if GEMINI_API_KEY:
+        return None
+    return {
+        "error": "Gemini API key is missing. Set GOOGLE_API_KEY or GEMINI_API_KEY before running the app."
+    }
+
+_EMBEDDING_MODEL = None
+
+def get_embedding_model():
+    """Lazily loads the local embedding model used for evidence retrieval."""
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None and SentenceTransformer:
+        print("--- Loading sentence-transformers embedding model ---")
+        try:
+            _EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception as e:
+            print(f"--- Unable to load embedding model; evidence retrieval will use lexical fallback: {e} ---")
+            return None
+    return _EMBEDDING_MODEL
+
+def extract_pdf_pages(file_path):
+    """Extract page-level text from a PDF with OCR fallback for scanned pages."""
+    pages = []
+    try:
+        with fitz.open(file_path) as doc:
+            for page_num, page in enumerate(doc, start=1):
+                pages.append({"page_number": page_num, "text": page.get_text()})
+
+        total_text = "\n".join(page["text"] for page in pages).strip()
+        if len(total_text) >= 100:
+            return pages
+
+        print("--- Minimal text found. Attempting page-level OCR fallback. ---")
+        ocr_pages = []
+        with fitz.open(file_path) as doc:
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=300)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_pages.append({
+                    "page_number": page_num + 1,
+                    "text": pytesseract.image_to_string(img)
+                })
+        return ocr_pages
+    except Exception as e:
+        return [{"page_number": 1, "text": f"Error reading PDF: {e}"}]
+
 def extract_text_from_pdf(file_path):
     """Extracts text from a PDF file."""
-    try:
-        text = ""
-        with fitz.open(file_path) as doc:
-            for page in doc:
-                text += page.get_text()
-
-        # If text is minimal, it's likely a scanned PDF. Use OCR as a fallback.
-        if len(text.strip()) < 100:
-            print("--- Minimal text found. Attempting OCR fallback. ---")
-            ocr_text = ""
-            with fitz.open(file_path) as doc:
-                for page_num in range(len(doc)):
-                    page = doc.load_page(page_num)
-                    # Render page to an image
-                    pix = page.get_pixmap(dpi=300)
-                    img_data = pix.tobytes("png")
-                    img = Image.open(io.BytesIO(img_data))
-                    # Perform OCR on the image
-                    ocr_text += pytesseract.image_to_string(img)
-            return ocr_text
-        else:
-            return text
-    except Exception as e:
-        return f"Error reading PDF: {e}"
+    pages = extract_pdf_pages(file_path)
+    return "\n".join(page.get("text", "") for page in pages)
 
 def extract_text_from_docx(file_path):
     """Extracts text from a DOCX file."""
@@ -70,11 +115,153 @@ def extract_text_from_txt(file_path):
     except Exception as e:
         return f"Error reading TXT: {e}"
 
+def build_page_chunks(uploaded_docs):
+    """Build searchable page chunks for every uploaded PDF."""
+    chunks = []
+    for doc_key, doc_info in uploaded_docs.items():
+        filename = doc_info.get('filename', '')
+        if not filename.lower().endswith('.pdf'):
+            continue
+
+        doc_name = DOCUMENT_TYPES.get(doc_key, {}).get('name', doc_key)
+        for page in extract_pdf_pages(doc_info['path']):
+            text = page.get("text", "").strip()
+            if not text:
+                continue
+            chunks.append({
+                "doc_key": doc_key,
+                "source_document": filename,
+                "document_type": doc_name,
+                "page_number": page.get("page_number"),
+                "text": text
+            })
+    return chunks
+
+def build_semantic_index(chunks):
+    """Build a FAISS index for page chunks when embedding dependencies exist."""
+    if not chunks or not SentenceTransformer or not faiss or np is None:
+        return None
+
+    model = get_embedding_model()
+    if model is None:
+        return None
+    texts = [chunk["text"] for chunk in chunks]
+    vectors = model.encode(texts, normalize_embeddings=True)
+    vectors = np.asarray(vectors, dtype=np.float32)
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+    return {"index": index, "model": model}
+
+def finding_to_query(finding):
+    """Create the retrieval query for a finding without asking an LLM again."""
+    query_parts = []
+    for field in ("risk_title", "issue_summary", "short_summary", "recommended_action"):
+        if finding.get(field):
+            query_parts.append(str(finding[field]))
+    for phrase in finding.get("evidence_queries", []) or []:
+        if phrase:
+            query_parts.append(str(phrase))
+    return " ".join(query_parts).strip()
+
+def normalize_for_match(text):
+    return re.sub(r"\s+", " ", text or "").strip().lower()
+
+def lexical_score(query, text):
+    query_norm = normalize_for_match(query)
+    text_norm = normalize_for_match(text)
+    if not query_norm or not text_norm:
+        return 0
+
+    query_terms = set(re.findall(r"[a-z0-9]{3,}", query_norm))
+    text_terms = set(re.findall(r"[a-z0-9]{3,}", text_norm))
+    overlap = len(query_terms & text_terms) / max(len(query_terms), 1)
+    ratio = SequenceMatcher(None, query_norm[:500], text_norm[:1000]).ratio()
+    return overlap + ratio
+
+def best_snippet(text, queries, max_chars=320):
+    """Return the sentence/window most relevant to the query terms."""
+    clean_text = re.sub(r"\s+", " ", text or "").strip()
+    if len(clean_text) <= max_chars:
+        return clean_text
+
+    query_text = " ".join(q for q in queries if q)
+    query_norm = normalize_for_match(query_text)
+    for phrase in sorted([q for q in queries if q], key=len, reverse=True):
+        phrase_norm = normalize_for_match(phrase)
+        if len(phrase_norm) < 5:
+            continue
+        idx = normalize_for_match(clean_text).find(phrase_norm)
+        if idx >= 0:
+            start = max(0, idx - 120)
+            end = min(len(clean_text), idx + len(phrase) + 180)
+            return clean_text[start:end].strip()
+
+    sentences = re.split(r"(?<=[.!?])\s+", clean_text)
+    best = max(sentences, key=lambda sentence: lexical_score(query_norm, sentence), default=clean_text)
+    if len(best) > max_chars:
+        best = best[:max_chars].rsplit(" ", 1)[0]
+    return best.strip()
+
+def locate_evidence_for_finding(finding, chunks, semantic_index):
+    """Find the best supporting PDF page for a finding using embeddings."""
+    if not chunks:
+        return None
+
+    queries = [q for q in finding.get("evidence_queries", []) or [] if q]
+    query = finding_to_query(finding)
+    if not query:
+        return None
+
+    best_chunk = None
+    if semantic_index:
+        qvec = semantic_index["model"].encode([query], normalize_embeddings=True)
+        qvec = np.asarray(qvec, dtype=np.float32)
+        _, indices = semantic_index["index"].search(qvec, 1)
+        if len(indices[0]) and indices[0][0] >= 0:
+            best_chunk = chunks[int(indices[0][0])]
+    else:
+        print("--- Embedding dependencies unavailable; using lexical evidence fallback ---")
+        best_chunk = max(chunks, key=lambda chunk: lexical_score(query, chunk["text"]), default=None)
+
+    if not best_chunk:
+        return None
+
+    evidence_text = best_snippet(best_chunk["text"], queries + [query])
+    return {
+        "doc_key": best_chunk["doc_key"],
+        "source_document": best_chunk["source_document"],
+        "page_number": best_chunk["page_number"],
+        "evidence_text": evidence_text
+    }
+
+def enrich_findings_with_evidence(key_findings, chunks):
+    """Attach source_document, page_number, and evidence_text to each finding."""
+    findings = key_findings.get("key_findings", []) if isinstance(key_findings, dict) else []
+    if not findings:
+        return key_findings
+
+    semantic_index = build_semantic_index(chunks)
+    for finding in findings:
+        if "issue_summary" not in finding and finding.get("short_summary"):
+            finding["issue_summary"] = finding["short_summary"]
+
+        evidence = locate_evidence_for_finding(finding, chunks, semantic_index)
+        if evidence:
+            finding.update(evidence)
+        else:
+            finding.setdefault("source_document", None)
+            finding.setdefault("page_number", None)
+            finding.setdefault("evidence_text", "")
+    return key_findings
+
 # --- AI Interaction with Gemini ---
 def analyze_document_with_ai(text):
     """
     Sends the document text to the Gemini API for analysis and returns the result.
     """
+    missing_key = gemini_api_key_error()
+    if missing_key:
+        return missing_key
     if text.strip() == "Unsupported file type.":
         return {"error": "This file type is not supported for analysis."}
     if not text or not text.strip():
@@ -154,7 +341,7 @@ Document:
 """
     try:
         print("--- Sending text to Gemini API for analysis ---")
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
         generation_config = {
             "temperature": 0,
             "response_mime_type": "application/json"
@@ -173,16 +360,20 @@ Document:
 
 def summarize_document_with_ai(doc_name, text):
     """Generates a structured summary for a single document."""
+    missing_key = gemini_api_key_error()
+    if missing_key:
+        return missing_key
+
     prompt = f"""
     You are a real estate analyst. Your task is to create a structured summary of the provided disclosure document.
     The document is a '{doc_name}'.
 
     Analyze the text below and extract the following information:
-    - `purpose`: A one-sentence description of the document's purpose.
-    - `defects`: An array of strings for explicitly mentioned problems (max 3 items).
-    - `foundation`: An array of strings for any mentions of foundation issues (max 3 items).
-    - `systems`: An array of strings for key property systems mentioned (max 3 items).
-    - `other`: An array of strings for other notable disclosures (max 3 items).
+    - "purpose": A one-sentence description of the document's purpose.
+    - "defects": An array of strings for explicitly mentioned problems (max 3 items).
+    - "foundation": An array of strings for any mentions of foundation issues (max 3 items).
+    - "systems": An array of strings for key property systems mentioned (max 3 items).
+    - "other": An array of strings for other notable disclosures (max 3 items).
 
     Format your response as a single JSON object with keys: "purpose", "defects", "foundation", "systems", "other".
     Each key except "purpose" should contain an array of strings. If a section has no items, return an empty array.
@@ -194,7 +385,7 @@ def summarize_document_with_ai(doc_name, text):
     """
     try:
         print(f"--- Summarizing '{doc_name}' with Gemini ---")
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
         generation_config = {"temperature": 0, "response_mime_type": "application/json"}
         response = model.generate_content(prompt, generation_config=generation_config)
         print("RAW RESPONSE (summarize_document_with_ai):", response.text)
@@ -208,22 +399,31 @@ def summarize_document_with_ai(doc_name, text):
 
 def synthesize_findings_with_ai(all_docs_text):
     """Generates high-level insights from all documents combined."""
+    missing_key = gemini_api_key_error()
+    if missing_key:
+        return missing_key
+
     prompt = f"""
     You are a senior real estate risk analyst. You have been given a collection of disclosure documents for a single property.
-    Your primary task is to **synthesize** information across all documents to find **recurring themes and corroborated risks**.
-    Identify the top 1-2 highest priority risks that are **mentioned or hinted at in multiple documents**. For example, if a water leak is mentioned in the SPQ and water stains are noted in the Home Inspection, that is a high-priority synthesized finding.
+    Your primary task is to extract and synthesize as many material property risks as possible from the disclosure package.
+    Do not limit the output to only the top risks. Include every meaningful risk, defect, hazard, repair concern, permit issue, water/moisture concern, pest issue, roof/foundation/system concern, legal/title concern, natural hazard, or recurring disclosure theme that could matter to a buyer.
+    Prefer broad coverage over brevity, but do not duplicate the same risk. If the same issue appears in multiple documents, merge it into one finding and list the supporting documents.
+    Sort findings by risk_level first (High, then Medium, then Low), then by likely buyer impact.
+    Aim for 8-15 findings when the documents contain enough issues. Return fewer only if the documents genuinely contain fewer material risks.
 
-    For each high-priority risk you identify, provide the following in a structured format:
-    - `risk_title`: A clear, concise title for the risk (e.g., "Water Intrusion History").
-    - `risk_level`: A string: "High", "Medium", or "Low".
-    - `short_summary`: A one-sentence summary of the issue.
-    - `evidence_sources`: An array of strings listing the document types where this was mentioned (e.g., ["SPQ", "TDS"]).
-    - `potential_impacts`: An array of strings describing potential consequences (max 3 items, e.g., ["Mold growth", "Structural damage"]).
-    - `cost_implication`: A string: "High", "Medium", or "Low".
-    - `recommended_action`: A short, actionable recommendation.
-    - `next_steps`: An array of strings with 2-3 concrete next steps.
+    For each risk you identify, provide the following in a compact structured format:
+    - "risk_title": A clear, concise title for the risk (e.g., "Water Intrusion History").
+    - "risk_level": A string: "High", "Medium", or "Low".
+    - "issue_summary": One short sentence, no more than 25 words.
+    - "short_summary": The same value as "issue_summary" for backwards compatibility.
+    - "evidence_sources": An array of strings listing the document types where this was mentioned (e.g., ["SPQ", "TDS"]).
+    - "evidence_queries": An array of 1-3 short phrases copied directly from the source documents. Never paraphrase these phrases. They will be used later for embedding retrieval.
+    - "potential_impacts": An array of strings describing potential consequences (max 2 short items, e.g., ["Mold growth", "Structural damage"]).
+    - "cost_implication": A string: "High", "Medium", or "Low".
+    - "recommended_action": One short actionable recommendation, no more than 18 words.
+    - "next_steps": An array of strings with 1-2 short concrete next steps.
 
-    Format your entire response as a single JSON object with two top-level keys: `key_findings` (an array of the risk objects) and `confidence` (a string: "High", "Medium", or "Low").
+    Format your entire response as a single JSON object with two top-level keys: "key_findings" (an array of the risk objects) and "confidence" (a string: "High", "Medium", or "Low").
     If no significant cross-document risks are found, return an empty array.
 
     Combined Document Texts:
@@ -234,7 +434,7 @@ def synthesize_findings_with_ai(all_docs_text):
     try:
         print("--- Synthesizing key findings with Gemini ---")
         # Use the more powerful model for this complex task
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-3.1-flash-lite')
         generation_config = {"temperature": 0, "response_mime_type": "application/json"}
         response = model.generate_content(prompt, generation_config=generation_config)
         print("RAW RESPONSE (synthesize_findings_with_ai):", response.text)
@@ -322,18 +522,25 @@ def analyze_all():
 
     document_summaries = []
     all_text_for_synthesis = ""
+    page_chunks = build_page_chunks(uploaded_docs)
 
     for doc_key, doc_info in uploaded_docs.items():
         text = process_single_file(doc_info['path'], doc_info['filename'])
         doc_name = DOCUMENT_TYPES[doc_key]['name']
         
         summary = summarize_document_with_ai(doc_name, text)
-        document_summaries.append({'doc_key': doc_key, 'doc_name': doc_name, 'summary': summary})
+        document_summaries.append({
+            'doc_key': doc_key,
+            'doc_name': doc_name,
+            'is_pdf': doc_info['filename'].lower().endswith('.pdf'),
+            'summary': summary
+        })
         
         all_text_for_synthesis += f"\n\n--- Start of Document: {doc_name} ---\n{text}\n--- End of Document: {doc_name} ---\n"
 
     # Generate the high-level synthesis
     key_findings = synthesize_findings_with_ai(all_text_for_synthesis)
+    key_findings = enrich_findings_with_evidence(key_findings, page_chunks)
 
     return render_template_string(ANALYSIS_TEMPLATE, uploaded_docs=uploaded_docs, doc_types=DOCUMENT_TYPES, summaries=document_summaries, key_findings=key_findings)
 
@@ -375,6 +582,24 @@ def view_doc(doc_key):
     if doc_info and os.path.exists(doc_info['path']):
         return send_from_directory(os.path.dirname(doc_info['path']), os.path.basename(doc_info['path']))
     return "File not found or session expired.", 404
+
+@app.route('/pdf_viewer/<doc_key>')
+def pdf_viewer(doc_key):
+    """Renders a lightweight PDF.js viewer that can jump to and highlight evidence."""
+    uploaded_docs = session.get('uploaded_docs', {})
+    doc_info = uploaded_docs.get(doc_key)
+    if not doc_info or not os.path.exists(doc_info['path']):
+        return "File not found or session expired.", 404
+    if not doc_info.get('filename', '').lower().endswith('.pdf'):
+        return "PDF viewer is only available for PDF files.", 400
+
+    return render_template_string(
+        PDFJS_VIEWER_TEMPLATE,
+        file_url=url_for('view_doc', doc_key=doc_key),
+        initial_page=request.args.get('page', 1, type=int),
+        highlight=request.args.get('highlight', ''),
+        filename=doc_info.get('filename', 'Document')
+    )
 
 @app.route('/download_csv')
 def download_csv():
@@ -657,6 +882,194 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# --- Embedded PDF.js Viewer Template ---
+PDFJS_VIEWER_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ filename }}</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css">
+    <style>
+        html, body { margin: 0; height: 100%; background: #3f464f; font-family: sans-serif; }
+        .toolbar {
+            height: 44px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 0 12px;
+            background: #20242a;
+            color: white;
+            box-sizing: border-box;
+        }
+        .toolbar button {
+            border: 1px solid #6b7280;
+            background: #343a42;
+            color: white;
+            border-radius: 4px;
+            padding: 5px 9px;
+            cursor: pointer;
+        }
+        .toolbar span { font-size: 13px; }
+        #viewer-shell {
+            height: calc(100vh - 44px);
+            overflow: auto;
+            display: flex;
+            justify-content: center;
+            padding: 18px;
+            box-sizing: border-box;
+        }
+        #page-wrap { position: relative; background: white; box-shadow: 0 2px 12px rgba(0,0,0,.35); }
+        #pdf-canvas { display: block; }
+        #text-layer {
+            position: absolute;
+            inset: 0;
+            overflow: hidden;
+            opacity: 1;
+            line-height: 1;
+        }
+        #text-layer span {
+            color: transparent;
+            position: absolute;
+            white-space: pre;
+            transform-origin: 0% 0%;
+        }
+        #text-layer span.evidence-hit {
+            background: rgba(255, 230, 0, .55);
+            border-radius: 2px;
+        }
+        #status { margin-left: auto; color: #d1d5db; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <button id="prev-page" title="Previous page">Prev</button>
+        <button id="next-page" title="Next page">Next</button>
+        <span>Page <strong id="page-num"></strong> / <span id="page-count">?</span></span>
+        <span id="status">{{ filename }}</span>
+    </div>
+    <div id="viewer-shell">
+        <div id="page-wrap">
+            <canvas id="pdf-canvas"></canvas>
+            <div id="text-layer" class="textLayer"></div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        const pdfUrl = {{ file_url | tojson }};
+        const highlightText = {{ highlight | tojson }};
+        let currentPage = Math.max(1, {{ initial_page | int }});
+        let pdfDoc = null;
+        let rendering = false;
+        let pendingPage = null;
+        const canvas = document.getElementById('pdf-canvas');
+        const ctx = canvas.getContext('2d');
+        const textLayer = document.getElementById('text-layer');
+        const pageWrap = document.getElementById('page-wrap');
+
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        function normalizeText(text) {
+            return (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+        }
+
+        function evidenceTerms(text) {
+            const words = normalizeText(text).match(/[a-z0-9]{4,}/g) || [];
+            const stop = new Set(['that', 'this', 'with', 'from', 'were', 'been', 'have', 'will', 'into', 'document', 'seller', 'property']);
+            return [...new Set(words.filter(word => !stop.has(word)))].slice(0, 14);
+        }
+
+        function applyHighlight() {
+            const fullNeedle = normalizeText(highlightText);
+            const terms = evidenceTerms(highlightText);
+            if (!fullNeedle && !terms.length) return;
+
+            let firstHit = null;
+            const spans = [...textLayer.querySelectorAll('span')];
+            spans.forEach(span => {
+                const spanText = normalizeText(span.textContent);
+                const directHit = fullNeedle.length > 8 && fullNeedle.includes(spanText) && spanText.length > 3;
+                const termHit = terms.some(term => spanText.includes(term));
+                if (directHit || termHit) {
+                    span.classList.add('evidence-hit');
+                    firstHit = firstHit || span;
+                }
+            });
+
+            if (firstHit) {
+                firstHit.scrollIntoView({ block: 'center', inline: 'center' });
+            }
+        }
+
+        async function renderPage(pageNumber) {
+            rendering = true;
+            const page = await pdfDoc.getPage(pageNumber);
+            const shellWidth = document.getElementById('viewer-shell').clientWidth - 36;
+            const baseViewport = page.getViewport({ scale: 1 });
+            const scale = Math.min(1.55, Math.max(.75, shellWidth / baseViewport.width));
+            const viewport = page.getViewport({ scale });
+
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            pageWrap.style.width = `${viewport.width}px`;
+            pageWrap.style.height = `${viewport.height}px`;
+            textLayer.innerHTML = '';
+
+            await page.render({ canvasContext: ctx, viewport }).promise;
+            const textContent = await page.getTextContent();
+            await pdfjsLib.renderTextLayer({
+                textContentSource: textContent,
+                container: textLayer,
+                viewport,
+                textDivs: []
+            }).promise;
+
+            document.getElementById('page-num').textContent = pageNumber;
+            applyHighlight();
+            rendering = false;
+
+            if (pendingPage !== null) {
+                const next = pendingPage;
+                pendingPage = null;
+                renderPage(next);
+            }
+        }
+
+        function queueRender(pageNumber) {
+            if (rendering) {
+                pendingPage = pageNumber;
+            } else {
+                renderPage(pageNumber);
+            }
+        }
+
+        document.getElementById('prev-page').addEventListener('click', () => {
+            if (currentPage <= 1) return;
+            currentPage -= 1;
+            queueRender(currentPage);
+        });
+
+        document.getElementById('next-page').addEventListener('click', () => {
+            if (!pdfDoc || currentPage >= pdfDoc.numPages) return;
+            currentPage += 1;
+            queueRender(currentPage);
+        });
+
+        pdfjsLib.getDocument(pdfUrl).promise.then(doc => {
+            pdfDoc = doc;
+            currentPage = Math.min(currentPage, pdfDoc.numPages);
+            document.getElementById('page-count').textContent = pdfDoc.numPages;
+            renderPage(currentPage);
+        }).catch(error => {
+            document.getElementById('status').textContent = `Unable to load PDF: ${error.message}`;
+        });
+    </script>
+</body>
+</html>
+"""
+
 # --- Analysis Page Template ---
 ANALYSIS_TEMPLATE = """
 <!doctype html>
@@ -666,67 +1079,55 @@ ANALYSIS_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Disclosure AI - Analysis Report</title>
     <style>
-        body { font-family: sans-serif; background-color: #f4f4f9; color: #333; margin: 40px; }
-        .dashboard-container { display: grid; grid-template-columns: 1fr 2fr; gap: 30px; max-width: 1400px; margin: auto; }
-        .left-panel, .right-panel { display: flex; flex-direction: column; gap: 20px; }
-        .card { background: white; padding: 20px; border-radius: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        body { font-family: sans-serif; background-color: #f4f4f9; color: #333; margin: 32px; }
+        .analysis-grid { display: grid; grid-template-columns: minmax(520px, 1.25fr) minmax(420px, .95fr); gap: 24px; align-items: start; max-width: 1600px; margin: auto; }
+        .left-column { display: flex; flex-direction: column; gap: 25px; }
+        .right-column { position: sticky; top: 20px; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
         h1, h2, h3 { color: #0056b3; }
         h2 { margin-top: 0; }
-        .doc-list { list-style: none; padding: 0; }
-        .doc-list-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-radius: 8px; cursor: pointer; }
-        .doc-list-item:hover { background-color: #e9ecef; }
-        .btn-preview { padding: 5px 10px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-size: 0.9em; }
-        .risk-card { border-left: 5px solid; }
-        .risk-card.high { border-color: #dc3545; background-color: #f8d7da; }
-        .risk-card.medium { border-color: #ffc107; background-color: #fff3cd; }
-        .risk-card.low { border-color: #28a745; background-color: #d4edda; }
+        #doc-selector { width: 100%; padding: 10px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #ccc; }
+        #pdf-viewer { width: 100%; height: 720px; border: none; border-radius: 8px; background: #20242a; }
+        .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .summary-card { background-color: #f8f9fa; padding: 15px; border-radius: 8px; }
+        .summary-card h4 { margin-top: 0; border-bottom: 1px solid #e9ecef; padding-bottom: 8px; }
+        .summary-card ul { padding-left: 20px; margin-bottom: 0; }
+        .risk-card { background: #fff; border: 1px solid #f0caca; border-left: 5px solid #dc3545; border-radius: 8px; padding: 18px; margin-bottom: 16px; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+        .risk-card:hover, .risk-card.active { border-color: #dc3545; box-shadow: 0 6px 18px rgba(220,53,69,.16); transform: translateY(-1px); }
+        .risk-card h3 { margin-top: 0; display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+        .risk-card p { overflow-wrap: anywhere; }
         .risk-badge { padding: 3px 8px; border-radius: 12px; color: white; font-size: 0.8em; font-weight: bold; }
         .badge-high { background-color: #dc3545; }
         .badge-medium { background-color: #ffc107; }
         .badge-low { background-color: #28a745; }
-        .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; }
-        details > summary { cursor: pointer; font-weight: bold; font-size: 1.1em; padding: 10px; border-radius: 8px; }
-        details > summary:hover { background-color: #f8f9fa; }
-        details[open] > summary { background-color: #e9ecef; }
-        .details-content { padding: 15px; border-top: 1px solid #dee2e6; }
+        .evidence-box { background: #fffbea; border: 1px solid #f5df8e; border-radius: 6px; padding: 10px 12px; font-size: .9em; color: #4d3b00; }
+        .evidence-meta { color: #6c757d; font-size: .8em; margin-bottom: 6px; }
         .error-box { background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 20px; border-radius: 5px; margin-top: 20px; }
+        @media(max-width: 1000px) {
+            .analysis-grid { grid-template-columns: 1fr; }
+            .right-column { position: static; }
+            #pdf-viewer { height: 560px; }
+        }
     </style>
 </head>
 <body>
-    <div class="dashboard-container">
-        <div class="left-panel">
+    <div class="analysis-grid">
+        <div class="left-column">
             <div class="card">
-                <h2>Documents</h2>
-                <ul class="doc-list">
-                    {% for key, doc_info in uploaded_docs.items() %}
-                    <li class="doc-list-item">
-                        <span>{{ doc_types[key].name }}</span>
-                        <a href="/view_doc/{{ key }}" target="_blank" class="btn-preview">Preview</a>
-                    </li>
+                <h2>Document Viewer</h2>
+                <select id="doc-selector">
+                    {% for summary_item in summaries %}
+                    <option value="{{ summary_item.doc_key }}" data-is-pdf="{{ 'true' if summary_item.is_pdf else 'false' }}">{{ summary_item.doc_name }}</option>
                     {% endfor %}
-                </ul>
+                </select>
+                <iframe id="pdf-viewer" title="PDF evidence viewer"></iframe>
             </div>
-            <div class="card">
-                <h2>Document Summaries</h2>
-                {% for summary_item in summaries %}
-                <details>
-                    <summary>{{ summary_item.doc_name }}</summary>
-                    <div class="details-content">
-                        <p><em>{{ summary_item.summary.get('purpose', 'N/A') }}</em></p>
-                        {% if summary_item.summary.get('error') %}
-                            <div class="error-box"><p><strong>Error:</strong> {{ summary_item.summary.get('error') }}</p></div>
-                        {% endif %}
-                        {% if summary_item.summary.get('defects') %}<h5>Defects</h5><ul>{% for item in summary_item.summary.defects %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
-                        {% if summary_item.summary.get('foundation') %}<h5>Foundation</h5><ul>{% for item in summary_item.summary.foundation %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
-                        {% if summary_item.summary.get('systems') %}<h5>Systems</h5><ul>{% for item in summary_item.summary.systems %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
-                        {% if summary_item.summary.get('other') %}<h5>Other</h5><ul>{% for item in summary_item.summary.other %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
-                    </div>
-                </details>
-                {% endfor %}
+            <div class="card" id="summary-section">
+                <!-- This section will be populated by JavaScript -->
             </div>
         </div>
 
-        <div class="right-panel">
+        <div class="right-column">
             <div class="card">
                 <h2>Key Findings & AI Insights</h2>
                 <p>Overall Analysis Confidence: <strong>{{ key_findings.get('confidence', 'N/A') }}</strong></p>
@@ -734,39 +1135,164 @@ ANALYSIS_TEMPLATE = """
                     <div class="error-box"><p><strong>Error during synthesis:</strong> {{ key_findings.get('error') }}</p></div>
                 {% endif %}
                 {% for finding in key_findings.get('key_findings', []) %}
-                    <div class="card risk-card {{ finding.risk_level|lower }}" style="margin-top: 15px;">
+                    <div class="risk-card" data-finding-index="{{ loop.index0 }}" role="button" tabindex="0">
                         <h3>
                             {{ finding.risk_title }}
                             <span class="risk-badge badge-{{ finding.risk_level|lower }}">{{ finding.risk_level }}</span>
                         </h3>
-                        <p><em>{{ finding.short_summary }}</em></p>
-                        <div class="summary-grid">
-                            <div class="card">
-                                <h5>Potential Impacts</h5>
-                                <ul>{% for impact in finding.potential_impacts %}<li>{{ impact }}</li>{% endfor %}</ul>
+                        <p><em>{{ finding.issue_summary or finding.short_summary }}</em></p>
+                        {% if finding.source_document and finding.page_number %}
+                            <div class="evidence-box">
+                                <div class="evidence-meta">{{ finding.source_document }} · Page {{ finding.page_number }}</div>
+                                {{ finding.evidence_text }}
                             </div>
-                            <div class="card">
-                                <h5>Suggested Next Steps</h5>
-                                <ul>{% for step in finding.next_steps %}<li>{{ step }}</li>{% endfor %}</ul>
+                        {% else %}
+                            <div class="evidence-box">
+                                <div class="evidence-meta">Evidence location unavailable</div>
+                                Install embedding dependencies and re-run analysis for semantic page retrieval.
                             </div>
-                        </div>
-                        <p style="font-size: 0.8em; color: #6c757d; margin-top: 15px;">
-                            <strong>Evidence:</strong> {{ finding.evidence_sources|join(', ') }} |
-                            <strong>Cost Implication:</strong> {{ finding.cost_implication }} |
-                            <strong>Recommended Action:</strong> {{ finding.recommended_action }}
+                        {% endif %}
+                        <p style="font-size: 0.8em; color: #6c757d; margin-top: 12px;">
+                            <strong>Sources:</strong> {{ finding.evidence_sources|join(', ') }} |
+                            <strong>Cost:</strong> {{ finding.cost_implication }} |
+                            <strong>Action:</strong> {{ finding.recommended_action }}
                         </p>
+                        {% if finding.potential_impacts %}
+                            <p style="font-size: 0.85em; margin-bottom: 0;"><strong>Impacts:</strong> {{ finding.potential_impacts|join(', ') }}</p>
+                        {% endif %}
+                        {% if finding.next_steps %}
+                            <p style="font-size: 0.85em; margin-top: 6px;"><strong>Next:</strong> {{ finding.next_steps|join(', ') }}</p>
+                        {% endif %}
                     </div>
                 {% else %}
                     <p>No high-priority cross-document risks were identified.</p>
                 {% endfor %}
             </div>
             <div class="card">
-                <h2>Follow-up Chat</h2>
+                <h2>AI Follow-up</h2>
                 <p style="color: #6c757d;">Ask the AI a follow-up question about these findings.</p>
                 <input type="text" placeholder="e.g., 'What are the typical costs to repair foundation cracks?'" style="width: 95%; padding: 10px; border: 1px solid #ccc; border-radius: 5px;">
             </div>
         </div>
     </div>
+    <script>
+        const summariesData = {{ summaries | tojson }};
+        const findingsData = {{ key_findings.get('key_findings', []) | tojson }};
+        const docSelector = document.getElementById('doc-selector');
+        const pdfViewer = document.getElementById('pdf-viewer');
+        const summarySection = document.getElementById('summary-section');
+        const riskCards = [...document.querySelectorAll('.risk-card')];
+
+        function escapeHtml(value) {
+            return String(value || '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+
+        function renderSummary(docKey) {
+            const summaryItem = summariesData.find(s => s.doc_key === docKey);
+            if (!summaryItem) {
+                summarySection.innerHTML = '<h2>Summary Not Found</h2>';
+                return;
+            }
+
+            const summary = summaryItem.summary;
+            let html = `<h2>Summary: ${escapeHtml(summaryItem.doc_name)}</h2>`;
+            html += `<p><em>${escapeHtml(summary.purpose || 'N/A')}</em></p>`;
+            
+            if (summary.error) {
+                html += `<div class="error-box"><p><strong>Error:</strong> ${escapeHtml(summary.error)}</p></div>`;
+            } else {
+                html += '<div class="summary-grid">';
+                if (summary.defects && summary.defects.length > 0) {
+                    html += '<div class="summary-card"><h4>Known Defects</h4><ul>' + summary.defects.map(i => `<li>${escapeHtml(i)}</li>`).join('') + '</ul></div>';
+                }
+                if (summary.foundation && summary.foundation.length > 0) {
+                    html += '<div class="summary-card"><h4>Foundation Risks</h4><ul>' + summary.foundation.map(i => `<li>${escapeHtml(i)}</li>`).join('') + '</ul></div>';
+                }
+                if (summary.systems && summary.systems.length > 0) {
+                    html += '<div class="summary-card"><h4>Property Systems</h4><ul>' + summary.systems.map(i => `<li>${escapeHtml(i)}</li>`).join('') + '</ul></div>';
+                }
+                if (summary.other && summary.other.length > 0) {
+                    html += '<div class="summary-card"><h4>Other Disclosures</h4><ul>' + summary.other.map(i => `<li>${escapeHtml(i)}</li>`).join('') + '</ul></div>';
+                }
+                html += '</div>';
+            }
+            summarySection.innerHTML = html;
+        }
+
+        function loadPdf(docKey, page = 1, evidenceText = '') {
+            const params = new URLSearchParams({
+                page: page || 1,
+                highlight: evidenceText || ''
+            });
+            pdfViewer.src = `/pdf_viewer/${encodeURIComponent(docKey)}?${params.toString()}`;
+            docSelector.value = docKey;
+            renderSummary(docKey);
+        }
+
+        function chooseDefaultFinding() {
+            const severityRank = { High: 0, Medium: 1, Low: 2 };
+            return findingsData
+                .map((finding, index) => ({ finding, index }))
+                .filter(item => item.finding.doc_key && item.finding.page_number)
+                .sort((a, b) => {
+                    const aRank = severityRank[a.finding.risk_level] ?? 3;
+                    const bRank = severityRank[b.finding.risk_level] ?? 3;
+                    return aRank - bRank || a.index - b.index;
+                })[0];
+        }
+
+        function selectFinding(index) {
+            const finding = findingsData[index];
+            if (!finding || !finding.doc_key || !finding.page_number) return;
+
+            riskCards.forEach(card => card.classList.toggle('active', Number(card.dataset.findingIndex) === index));
+            loadPdf(finding.doc_key, finding.page_number, finding.evidence_text || '');
+        }
+
+        docSelector.addEventListener('change', (event) => {
+            const selectedOption = event.target.selectedOptions[0];
+            const selectedDocKey = event.target.value;
+            riskCards.forEach(card => card.classList.remove('active'));
+            renderSummary(selectedDocKey);
+
+            if (selectedOption && selectedOption.dataset.isPdf === 'true') {
+                loadPdf(selectedDocKey);
+            } else {
+                pdfViewer.removeAttribute('src');
+            }
+        });
+
+        riskCards.forEach(card => {
+            const index = Number(card.dataset.findingIndex);
+            card.addEventListener('click', () => selectFinding(index));
+            card.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    selectFinding(index);
+                }
+            });
+        });
+
+        // Initial render
+        if (summariesData.length > 0) {
+            const defaultFinding = chooseDefaultFinding();
+            if (defaultFinding) {
+                selectFinding(defaultFinding.index);
+            } else {
+                const firstPdf = summariesData.find(item => item.is_pdf) || summariesData[0];
+                renderSummary(firstPdf.doc_key);
+                if (firstPdf.is_pdf) {
+                    loadPdf(firstPdf.doc_key);
+                }
+            }
+        }
+    </script>
 </body>
 </html>
 """
